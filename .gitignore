@@ -1,0 +1,14 @@
+# OpenClaw Lab OSS Gitignore
+.env
+.openclaw/
+sandbox_data/
+*.log
+*.bak
+*.tmp
+sessions/
+filebrowser.db
+google_credentials.json
+node_modules/
+dist/
+coverage/
+.DS_Store

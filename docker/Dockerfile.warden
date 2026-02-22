@@ -1,0 +1,13 @@
+FROM alpine:latest
+
+# Install ClamAV (Antivirus), Inotify (File Watcher)
+RUN apk add --no-cache clamav clamav-daemon inotify-tools bash
+
+# Update Virus Definitions (Can take a moment)
+RUN freshclam || true
+
+# Add the Warden Logic Script
+COPY warden.sh /warden.sh
+RUN chmod +x /warden.sh
+
+ENTRYPOINT ["/warden.sh"]

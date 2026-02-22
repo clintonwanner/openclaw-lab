@@ -1,0 +1,119 @@
+services:
+  # --- THE PRISONER ---
+  # The AI Agent. Isolated by strict resource limits and network rules.
+  openclaw:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.openclaw
+    container_name: openclaw_vm
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: false # Needed for some node operations, but we use volumes for persistence
+    tmpfs:
+      - /tmp
+      - /run
+    dns:
+      - 94.140.14.14  # AdGuard DNS
+      - 94.140.15.15
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - OPENCLAW_MODEL=${OPENCLAW_MODEL}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+      - GOG_KEYRING_PASSWORD=openclaw
+      - WORKSPACE_DIR=/app/workspace
+      - OPENCLAW_GATEWAY_ALLOW_PLAINTEXT_REMOTE=${OPENCLAW_GATEWAY_ALLOW_PLAINTEXT_REMOTE}
+      - NODE_OPTIONS=${OPENCLAW_NODE_OPTIONS:-}
+      - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY}
+      - BRAVE_API_KEY=${BRAVE_API_KEY}
+      - OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL}
+      - NODE_TLS_REJECT_UNAUTHORIZED=${OPENCLAW_NODE_TLS_REJECT_UNAUTHORIZED:-}
+      - LANG=en_US.UTF-8
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - sandbox_data:/app/workspace  # Shared "Hot" Volume
+      - ./sandbox_data/openclaw_config:/app/.openclaw  # Persistent Config
+      - ./sandbox_data/gog_config:/home/prisoner/.config/gogcli # Google Suite Persistence
+      - ./sandbox_data/linuxbrew:/home/linuxbrew # Homebrew Persistence
+      - ./sandbox_data/prisoner_home:/home/prisoner # Shell & Tool Persistence
+      # - ./google_credentials.json:/app/google_credentials.json:ro # Optional: Google OAuth
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: 12G
+        reservations:
+          memory: 4G
+    cap_drop:
+      - ALL
+    networks:
+      isolated:
+        ipv4_address: 172.30.0.2
+    ports:
+      - "18789:18789"
+
+  # --- THE WARDEN ---
+  # Security Sidecar. Watches the shared volume for malware/scripts.
+  warden:
+    build: 
+      context: .
+      dockerfile: docker/Dockerfile.warden
+    container_name: warden_sentry
+    restart: always
+    networks:
+      isolated:
+        ipv4_address: 172.30.0.4
+    volumes:
+      - sandbox_data:/scandir  # Mounts the SAME volume to monitor it
+    environment:
+      - PRISONER_CONTAINER_NAME=openclaw_vm
+    # Note: privileged mode removed for security
+    # Warden will use Docker API via socket mount if needed
+
+  # --- THE AIRLOCK ---
+  # Safe File Transfer. "Look but don't touch."
+  airlock:
+    image: filebrowser/filebrowser:latest
+    container_name: airlock_gui
+    restart: unless-stopped
+    networks:
+      isolated:
+        ipv4_address: 172.30.0.3
+    volumes:
+      - sandbox_data:/srv  # Read-Only view of the data
+      - ./filebrowser.db:/database/filebrowser.db
+    ports:
+      - "127.0.0.1:8082:8080"  # Binds strictly to localhost
+    security_opt:
+      - no-new-privileges
+    environment:
+      - FB_BASEURL=/
+      - FB_PORT=8080
+      - FB_ADDRESS=0.0.0.0
+      - FB_DATABASE=/database/filebrowser.db
+      - FB_ROOT=/srv
+      - FB_USERNAME=admin
+      - FB_PASSWORD=admin12345678
+
+# --- HARDWARE & NETWORK DEFINITIONS ---
+networks:
+  isolated:
+    name: openclaw-lab_isolated_vlan
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  sandbox_data:  # The "Radioactive" Zone.
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/sandbox_data
+

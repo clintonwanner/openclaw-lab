@@ -1,0 +1,326 @@
+#!/bin/bash
+
+# OpenClaw Control CLI (oc)
+# A host-level wrapper for managing the OpenClaw sandbox stack.
+
+# Get the directory where the script is located (bin/)
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Set PROJECT_DIR to the parent of bin/
+PROJECT_DIR="$(cd "$BIN_DIR/.." && pwd)"
+
+CONTAINER_NAME="openclaw_vm"
+SERVICE_NAME="openclaw-stack.service"
+SYSTEMCTL="/usr/bin/systemctl"
+ENV_FILE="$PROJECT_DIR/.env"
+# OSS Structure: config is usually generated in sandbox_data/
+CONFIG_FILE="$PROJECT_DIR/sandbox_data/openclaw_config/openclaw.json"
+COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+function usage() {
+    echo -e "${BLUE}OpenClaw Control (oc)${NC} - v1.3.0"
+    echo "The essential CLI for managing the Ironclad Sandbox environment."
+    echo ""
+    echo "Usage: oc [command]"
+    echo ""
+    echo "Commands:"
+    echo "  up             Start the entire OpenClaw stack"
+    echo "  down           Stop the entire OpenClaw stack"
+    echo "  restart        Restart the stack and apply new config/.env changes"
+    echo "  status         Show health, resource usage, and active primary model"
+    echo "  config [sub]   Dynamic configuration (model, token, provider, status, key)"
+    echo "  logs           Tail the gateway logs (real-time)"
+    echo "  fix            Automatically repair config (doctor --fix) and restart"
+    echo "  auth           Run the Google Workspace (gog) interactive OAuth handshake"
+    echo "  shell          Open an interactive bash terminal inside the sandbox"
+    echo "  upgrade        Perform a safe, live software update (requires recent backup)"
+    echo "  help           Show this help message"
+    echo ""
+}
+
+function config_usage() {
+    echo "Usage: oc config [sub-command]"
+    echo ""
+    echo "Sub-commands:"
+    echo "  model          Interactive selection of active LLM model"
+    echo "  token          Update the gateway authentication token"
+    echo "  provider       Manage AI providers (add, switch)"
+    echo "  key            Manage API keys in .env and docker-compose"
+    echo "  status         Show current configuration and sync status"
+    echo ""
+}
+
+function apply_config_change() {
+    local KEY=$1
+    local VALUE=$2
+    local EXTRA=$3 # For provider add: BaseURL, KeyName, etc.
+
+    # 1. Backup (Trinity)
+    cp "$ENV_FILE" "$ENV_FILE.bak"
+    cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
+    cp "$COMPOSE_FILE" "$COMPOSE_FILE.bak"
+
+    echo -e "${YELLOW}Applying change: $KEY -> $VALUE${NC}"
+
+    # 2. Patch
+    case "$KEY" in
+        model)
+            sed -i "s|^OPENCLAW_MODEL=.*|OPENCLAW_MODEL=$VALUE|" "$ENV_FILE"
+            jq ".agents.defaults.model.primary = \"$VALUE\"" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+            ;;
+        token)
+            sed -i "s|^OPENCLAW_GATEWAY_TOKEN=.*|OPENCLAW_GATEWAY_TOKEN=$VALUE|" "$ENV_FILE"
+            jq ".gateway.auth.token = \"$VALUE\"" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+            ;;
+        key_add)
+            local NAME=$VALUE
+            local VAL=$EXTRA
+            # Append to .env if not exists, or update
+            if grep -q "^$NAME=" "$ENV_FILE"; then
+                sed -i "s|^$NAME=.*|$NAME=$VAL|" "$ENV_FILE"
+            else
+                echo "$NAME=$VAL" >> "$ENV_FILE"
+            fi
+            # Add to compose if not exists
+            if ! grep -q "\- $NAME=\${$NAME}" "$COMPOSE_FILE"; then
+                if grep -q "GOG_KEYRING_PASSWORD" "$COMPOSE_FILE"; then
+                    sed -i "/GOG_KEYRING_PASSWORD/i \      - $NAME=\${$NAME}" "$COMPOSE_FILE"
+                else
+                    # Fallback: find environment block and append
+                    sed -i "/environment:/a \      - $NAME=\${$NAME}" "$COMPOSE_FILE"
+                fi
+            fi
+            ;;
+        provider_add)
+            local P_NAME=$VALUE
+            local P_URL=$(echo "$EXTRA" | cut -d'|' -f1)
+            local P_KEY_NAME=$(echo "$EXTRA" | cut -d'|' -f2)
+            local P_MODEL_ID=$(echo "$EXTRA" | cut -d'|' -f3)
+            
+            jq ".models.providers[\"$P_NAME\"] = {
+                baseUrl: \"$P_URL\",
+                apiKey: \"\${$P_KEY_NAME}\",
+                api: \"openai-completions\",
+                models: [ { id: \"$P_MODEL_ID\", name: \"$P_MODEL_ID\" } ]
+            }" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+            ;;
+    esac
+
+    # 3. Validate
+    echo -e "${YELLOW}Restarting stack for validation...${NC}"
+    sudo $SYSTEMCTL restart $SERVICE_NAME
+    
+    # Wait for gateway to attempt boot
+    local RETRIES=10
+    local SUCCESS=0
+    while [ $RETRIES -gt 0 ]; do
+        if curl -s http://localhost:18789/health > /dev/null; then
+            SUCCESS=1
+            break
+        fi
+        sleep 2
+        RETRIES=$((RETRIES-1))
+    done
+
+    if [ $SUCCESS -eq 1 ]; then
+        echo -e "${GREEN}Update successful and verified.${NC}"
+        rm "$ENV_FILE.bak" "$CONFIG_FILE.bak" "$COMPOSE_FILE.bak"
+    else
+        echo -e "${RED}ERROR: Gateway health check failed! Rolling back...${NC}"
+        mv "$ENV_FILE.bak" "$ENV_FILE"
+        mv "$CONFIG_FILE.bak" "$CONFIG_FILE"
+        mv "$COMPOSE_FILE.bak" "$COMPOSE_FILE"
+        sudo $SYSTEMCTL restart $SERVICE_NAME
+        echo -e "${YELLOW}Rollback complete. System restored to previous state.${NC}"
+        exit 1
+    fi
+}
+
+function config_model() {
+    echo -e "${BLUE}--- OpenClaw Model Selection ---${NC}"
+    local CURRENT_MODEL=$(jq -r '.agents.defaults.model.primary' "$CONFIG_FILE")
+    
+    # Discovery
+    declare -A MODELS
+    # 1. From JSON
+    for m in $(jq -r '.agents.defaults.models | keys[]' "$CONFIG_FILE"); do
+        MODELS[$m]="[CONFIGURED]"
+    done
+    # 2. From Ollama
+    if curl -s --connect-timeout 2 http://localhost:11434/api/tags > /dev/null; then
+        for m in $(curl -s http://localhost:11434/api/tags | jq -r '.models[].name'); do
+            MODELS["ollama/$m"]="[AVAILABLE (OLLAMA)]"
+        done
+    fi
+    
+    # Display Menu
+    local i=1
+    local MENU_ITEMS=()
+    local SORTED_KEYS=$(echo "${!MODELS[@]}" | tr ' ' '\n' | sort)
+    for m in $SORTED_KEYS; do
+        local STATUS=${MODELS[$m]}
+        if [ "$m" == "$CURRENT_MODEL" ]; then STATUS="[ACTIVE]"; fi
+        printf "%2d) %-40s %s\n" "$i" "$m" "$STATUS"
+        MENU_ITEMS[$i]=$m
+        i=$((i+1))
+    done
+    
+    echo -e "--------------------------------"
+    read -p "Select a model [1-$((i-1))]: " CHOICE
+    local SELECTED_MODEL=${MENU_ITEMS[$CHOICE]}
+    
+    if [ -n "$SELECTED_MODEL" ]; then
+        apply_config_change model "$SELECTED_MODEL"
+    else
+        echo -e "${RED}Invalid selection.${NC}"
+    fi
+}
+
+function config_key() {
+    local NAME=$1
+    local VAL=$2
+    if [ -z "$NAME" ]; then
+        echo -e "${BLUE}--- Active API Keys ---${NC}"
+        grep -E "^[A-Z_]+_API_KEY=" "$ENV_FILE" | nl
+        read -p "Enter new key name (e.g. GROQ_API_KEY) or number to update: " INPUT
+        if [[ "$INPUT" =~ ^[0-9]+$ ]]; then
+            NAME=$(grep -E "^[A-Z_]+_API_KEY=" "$ENV_FILE" | sed -n "${INPUT}p" | cut -d= -f1)
+        else
+            NAME=$INPUT
+        fi
+    fi
+    if [ -n "$NAME" ]; then
+        if [ -z "$VAL" ]; then
+            read -p "Enter value for $NAME: " VAL
+        fi
+        if [ -n "$VAL" ]; then
+            apply_config_change key_add "$NAME" "$VAL"
+        fi
+    fi
+}
+
+function config_provider() {
+    if [ "$1" == "add" ]; then
+        echo -e "${BLUE}--- Add New AI Provider ---${NC}"
+        read -p "Provider ID (e.g. groq): " P_ID
+        read -p "Base URL [https://api.openai.com/v1]: " P_URL
+        P_URL=${P_URL:-"https://api.openai.com/v1"}
+        read -p "API Key Env Var Name [${P_ID^^}_API_KEY]: " P_KEY_NAME
+        P_KEY_NAME=${P_KEY_NAME:-"${P_ID^^}_API_KEY"}
+        
+        # Check if key exists
+        if ! grep -q "^$P_KEY_NAME=" "$ENV_FILE"; then
+            read -p "Enter value for $P_KEY_NAME: " P_KEY_VAL
+            apply_config_change key_add "$P_KEY_NAME" "$P_KEY_VAL"
+        fi
+        
+        read -p "Initial Model ID (optional): " P_MODEL
+        P_MODEL=${P_MODEL:-"auto"}
+        
+        apply_config_change provider_add "$P_ID" "$P_URL|$P_KEY_NAME|$P_MODEL"
+    else
+        echo -e "${BLUE}--- OpenClaw Provider Selection ---${NC}"
+        local i=1
+        local PROVIDERS=()
+        for p in $(jq -r '.models.providers | keys[]' "$CONFIG_FILE"); do
+            echo "$i) $p"
+            PROVIDERS[$i]=$p
+            i=$((i+1))
+        done
+        echo -e "--------------------------------"
+        read -p "Select a provider [1-$((i-1))] (or type 'add'): " CHOICE
+        if [ "$CHOICE" == "add" ]; then
+            config_provider add
+        else
+            local SELECTED_PROVIDER=${PROVIDERS[$CHOICE]}
+            if [ -n "$SELECTED_PROVIDER" ]; then
+                local FIRST_MODEL=$(jq -r ".models.providers[\"$SELECTED_PROVIDER\"].models[0].id // empty" "$CONFIG_FILE")
+                if [ -z "$FIRST_MODEL" ]; then
+                    FIRST_MODEL="$SELECTED_PROVIDER/auto"
+                else
+                    FIRST_MODEL="$SELECTED_PROVIDER/$FIRST_MODEL"
+                fi
+                apply_config_change model "$FIRST_MODEL"
+            else
+                echo -e "${RED}Invalid selection.${NC}"
+            fi
+        fi
+    fi
+}
+
+function config_status() {
+    echo -e "${BLUE}--- Configuration Status ---${NC}"
+    echo -e "Active Model (JSON): $(jq -r '.agents.defaults.model.primary' "$CONFIG_FILE")"
+    echo -e "Active Model (ENV) : $(grep "^OPENCLAW_MODEL=" "$ENV_FILE" | cut -d= -f2)"
+    echo -e "Gateway Token (JSON): $(jq -r '.gateway.auth.token' "$CONFIG_FILE" | cut -c1-8)..."
+    echo -e "Gateway Token (ENV) : $(grep "^OPENCLAW_GATEWAY_TOKEN=" "$ENV_FILE" | cut -d= -f2 | cut -c1-8)..."
+}
+
+case "$1" in
+    config)
+        case "$2" in
+            model)    config_model ;;
+            token)    config_token "$3" ;;
+            provider) config_provider "$3" ;;
+            key)      config_key "$3" "$4" ;;
+            status)   config_status ;;
+            *)        config_usage ;;
+        esac
+        ;;
+    up)
+        echo -e "${GREEN}Starting OpenClaw Stack...${NC}"
+        sudo $SYSTEMCTL start $SERVICE_NAME
+        ;;
+    down)
+        echo -e "${RED}Stopping OpenClaw Stack...${NC}"
+        sudo $SYSTEMCTL stop $SERVICE_NAME
+        ;;
+    restart)
+        echo -e "${YELLOW}Restarting OpenClaw Stack...${NC}"
+        sudo $SYSTEMCTL restart $SERVICE_NAME
+        sleep 2
+        docker stats --no-stream $CONTAINER_NAME
+        ;;
+    status)
+        echo -e "${BLUE}--- System Status ---${NC}"
+        sudo $SYSTEMCTL status $SERVICE_NAME
+        echo ""
+        echo -e "${BLUE}--- Container Resources ---${NC}"
+        docker stats --no-stream $CONTAINER_NAME
+        echo ""
+        echo -e "${BLUE}--- Active Model ---${NC}"
+        docker exec $CONTAINER_NAME openclaw config get agents.defaults.model 2>/dev/null || echo "Gateway offline"
+        ;;
+    logs)
+        docker logs -f --tail 50 $CONTAINER_NAME
+        ;;
+    fix)
+        echo -e "${YELLOW}Running Doctor and Repairing Config...${NC}"
+        docker exec $CONTAINER_NAME openclaw doctor --fix
+        sudo $SYSTEMCTL restart $SERVICE_NAME
+        echo -e "${GREEN}Stack repaired and restarted.${NC}"
+        ;;
+    auth)
+        echo -e "${BLUE}Initiating Google OAuth Handshake...${NC}"
+        read -p "Enter your Google email: " USER_EMAIL
+        docker exec -it -e GOG_KEYRING_PASSWORD=openclaw $CONTAINER_NAME gog auth add "$USER_EMAIL" --services gmail,calendar,drive,contacts,sheets,docs --manual
+        ;;
+    shell)
+        docker exec -it -u prisoner $CONTAINER_NAME /bin/bash
+        ;;
+    upgrade|update)
+        bash "$PROJECT_DIR/scripts/surgical_upgrade.sh"
+        ;;
+    help|--help|-h)
+        usage
+        ;;
+    *)
+        usage
+        ;;
+esac
